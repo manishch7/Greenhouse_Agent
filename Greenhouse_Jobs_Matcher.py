@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # ---------- CONFIG ----------
-RESUME_PDF = "Manish_Choudhary_Resume.pdf"
+RESUME_PDF = "Resume.pdf"
 CONCURRENCY_LIMIT = 5
 BATCH_SIZE = 20
 
