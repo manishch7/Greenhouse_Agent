@@ -21,6 +21,7 @@ import time
 import pandas as pd
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from sqlalchemy import text
 logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -77,7 +78,7 @@ async def run():
         logger.info("Loading jobs to classify location")
 
         df = pd.read_sql(
-            f"""
+            text(f"""
             SELECT
                 JOB_ID   AS job_id,
                 LOCATION AS location
@@ -86,7 +87,7 @@ async def run():
               AND IN_USA IS NULL
               AND LOCATION IS NOT NULL
               AND PUBLISHED_AT >= DATEADD(day, -2, CURRENT_TIMESTAMP())
-            """,
+            """),
             engine
         )
         

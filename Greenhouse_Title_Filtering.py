@@ -15,6 +15,7 @@ import time
 # ---------- THIRD PARTY ----------
 import pandas as pd
 from dotenv import load_dotenv
+from sqlalchemy import text
 logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -62,7 +63,7 @@ def run():
         logger.info("Fetching jobs to process")
 
         df = pd.read_sql(
-            f"""
+            text(f"""
             SELECT 
                 JOB_ID as job_id, 
                 TITLE as title, 
@@ -70,7 +71,7 @@ def run():
             FROM {SF_DATABASE}.{SF_SCHEMA}.{SF_TABLE}
             WHERE TITLE_FILTERED IS NULL
               AND PUBLISHED_AT >= DATEADD(day, -2, CURRENT_TIMESTAMP())
-            """,
+            """),
             engine  # ✅ Use engine for reads
         )
         

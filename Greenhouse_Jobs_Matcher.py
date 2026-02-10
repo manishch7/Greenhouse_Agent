@@ -14,6 +14,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from pypdf import PdfReader
+from sqlalchemy import text
 
 # ---------- LOCAL ----------
 from snowflake_utils import get_engine, get_connection, SF_DATABASE, SF_SCHEMA, SF_TABLE
@@ -49,7 +50,7 @@ def load_resume_text(path):
 # ---------- LOAD JOBS ----------
 def load_jobs(engine):
     return pd.read_sql(
-        f"""
+        text(f"""
         SELECT
             JOB_ID as job_id,
             TITLE as title,
@@ -58,7 +59,7 @@ def load_jobs(engine):
         WHERE TITLE_FILTERED = 'TRUE'
           AND IN_USA = 'Yes'
           AND FIT_SCORE IS NULL
-        """,
+        """),
         engine
     )
 
