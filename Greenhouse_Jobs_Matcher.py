@@ -3,7 +3,7 @@ Greenhouse_Jobs_Matcher.py
 
 Match jobs against resume using LLM.
 Processes jobs where TITLE_FILTERED = 'TRUE' AND IN_USA = 'Yes' AND FIT_SCORE IS NULL.
-Updates FIT_SCORE, VISA_SPONSOR, and REASON directly in Snowflake.
+Updates FIT_SCORE and VISA_SPONSOR directly in Snowflake.
 """
 
 import os
@@ -49,36 +49,75 @@ def load_resume_text(path):
 
 # ---------- LOAD JOBS ----------
 def load_jobs(engine):
-    return pd.read_sql(
-        text(f"""
-        SELECT
-            JOB_ID as job_id,
-            TITLE as title,
-            DESCRIPTION as description
-        FROM {SF_DATABASE}.{SF_SCHEMA}.{SF_TABLE}
-        WHERE TITLE_FILTERED = 'TRUE'
-          AND IN_USA = 'Yes'
-          AND FIT_SCORE IS NULL
-        """),
-        engine
-    )
+    try:
+        logger.info(f"Loading jobs from {SF_DATABASE}.{SF_SCHEMA}.{SF_TABLE}")
+        
+        query = text(f"""
+            SELECT
+                JOB_ID as job_id,
+                TITLE as title,
+                DESCRIPTION as description
+            FROM {SF_DATABASE}.{SF_SCHEMA}.{SF_TABLE}
+            WHERE TITLE_FILTERED = 'TRUE'
+              AND IN_USA = 'Yes'
+              AND FIT_SCORE IS NULL
+            """)
+        
+        df = pd.read_sql(query, engine)
+        
+        # Deduplicate immediately after fetch (defense in depth)
+        df = df.drop_duplicates(subset=['job_id'], keep='last')
+        
+        logger.info(f"Loaded {len(df)} jobs")
+        return df
+    except Exception as e:
+        logger.error(f"Failed to load jobs: {e}", exc_info=True)
+        raise
 
 # ---------- ASYNC MATCH ----------
 async def analyze_job(job, sem, resume_text):
     async with sem:
         prompt = f"""
-You are matching a job description against a candidate's resume.
+Match this job against the candidate's resume and provide a fit score.
 
-Evaluate:
-1. Skill, Experience and role alignment 
-2. Visa eligibility
+CANDIDATE PROFILE:
+- Senior Data Analyst with 3+ years experience in SQL analytics, Python ETL, Power BI, and cloud data platforms
+- Strong technical background: Snowflake, Apache Airflow, AWS/GCP, API automation, CI/CD
+- Open to: Data Analyst, Data Engineer, Business Intelligence, Analytics Engineer, Data Scientist roles
+- Also considering: Software Engineer roles with data/backend/automation focus
 
-Match Evaluation:
-- Compare core skills, tools, responsibilities, and seniority
-- Base conclusions only on explicit evidence
-- Do not assume missing requirements
+SCORING CRITERIA:
+1. Technical Skills Match (40 points):
+   - SQL, Python (pandas, numpy, asyncio)
+   - Cloud platforms (Snowflake, AWS, GCP)
+   - BI tools (Power BI, Tableau, Looker)
+   - ETL pipelines, APIs, data orchestration
+   
+2. Experience & Domain (30 points):
+   - Data analysis, reporting, dashboards
+   - Data engineering, pipeline automation
+   - 3+ years relevant experience
+   - Analytics, compliance, operations background
 
-Visa Rules (IMPORTANT):
+3. Role Alignment (30 points):
+   - Data Analyst/Engineer/BI → Excellent fit
+   - Analytics Engineer/Data Scientist → Good fit
+   - Software Engineer (backend/data focus) → Good fit
+   - Software Engineer (frontend/mobile) → Lower fit
+
+SCORING GUIDELINES:
+- 80-100: Excellent match - Core data roles (Analyst, Engineer, BI, Analytics Engineer)
+- 65-79: Good match - Data Scientist, Software Engineer with data/backend, adjacent analytics roles
+- 50-64: Moderate match - Software roles with some data components, different tech stack but transferable
+- 30-49: Weak match - Senior-only (7+ years), pure frontend/mobile, minimal data focus
+- 0-29: Poor match - Unrelated field, 10+ years required, completely different tech
+
+IMPORTANT: 
+- Prioritize data-focused roles but don't penalize Software Engineer titles if responsibilities involve databases, APIs, pipelines, or backend systems
+- Consider job descriptions, not just titles
+- Missing 1-2 specific tools is fine if core skills align
+
+VISA RULES (STRICT):
 Set visa = "No" ONLY IF the description explicitly states:
 - U.S. citizenship is required
 - Security clearance is required
@@ -90,19 +129,15 @@ If it only says:
 
 Do NOT mark visa as "No". Mark as "Yes".
 
-Resume:
+RESUME:
 {resume_text}
 
-Job Title:
-{job['title']}
-
-Job Description:
+JOB DESCRIPTION:
 {job['description']}
 
-Output Format (STRICT):
-score: integer between 0 and 100
-visa: Yes or No
-reason: 1–2 concise sentences
+OUTPUT (exact format):
+score: [0-100]
+visa: [Yes/No]
 """
 
         try:
@@ -119,7 +154,6 @@ reason: 1–2 concise sentences
 
         score = "0"
         visa = "yes"
-        reason = ""
 
         for line in text.splitlines():
             l = line.lower()
@@ -127,8 +161,6 @@ reason: 1–2 concise sentences
                 score = line.split(":", 1)[1].strip()
             elif l.startswith("visa"):
                 visa = line.split(":", 1)[1].strip().lower()
-            elif l.startswith("reason"):
-                reason = line.split(":", 1)[1].strip()
 
         if not score.isdigit():
             score = "0"
@@ -138,7 +170,6 @@ reason: 1–2 concise sentences
         return (
             score,
             visa,
-            reason,
             job["job_id"]
         )
 
@@ -167,15 +198,6 @@ async def run(
         jobs = df.to_dict("records")
         sem = asyncio.Semaphore(concurrency)
 
-        update_sql = f"""
-            UPDATE {SF_DATABASE}.{SF_SCHEMA}.{SF_TABLE}
-            SET
-                FIT_SCORE = %s,
-                VISA_SPONSOR = %s,
-                REASON = %s
-            WHERE JOB_ID = %s
-        """
-
         cur = conn.cursor()
         updated = 0
 
@@ -190,11 +212,21 @@ async def run(
 
             rows = [r for r in results if r]
             if rows:
+                # Deduplicate by job_id (keep last)
+                seen = set()
+                unique_rows = []
+                for row in reversed(rows):
+                    job_id = row[2]
+                    if job_id not in seen:
+                        seen.add(job_id)
+                        unique_rows.append(row)
+                rows = list(reversed(unique_rows))
+                
                 # Build VALUES clause for MERGE (much faster than executemany)
-                # row format: (score, visa, reason, job_id)
+                # row format: (score, visa, job_id)
                 values_list = [
-                    f"('{job_id}', {score}, '{visa}', '{reason.replace(chr(39), chr(39)+chr(39))}')"
-                    for score, visa, reason, job_id in rows
+                    f"('{job_id}', {score}, '{visa}')"
+                    for score, visa, job_id in rows
                 ]
                 values_str = ",\n".join(values_list)
                 
@@ -204,16 +236,14 @@ async def run(
                     SELECT 
                         column1 AS job_id,
                         column2 AS fit_score,
-                        column3 AS visa_sponsor,
-                        column4 AS reason
+                        column3 AS visa_sponsor
                     FROM VALUES {values_str}
                 ) AS source
                 ON target.JOB_ID = source.job_id
                 WHEN MATCHED THEN
                     UPDATE SET 
                         target.FIT_SCORE = source.fit_score,
-                        target.VISA_SPONSOR = source.visa_sponsor,
-                        target.REASON = source.reason
+                        target.VISA_SPONSOR = source.visa_sponsor
                 """
                 
                 cur.execute(merge_sql)
@@ -223,7 +253,7 @@ async def run(
             logger.info("Batch %d-%d completed in %.2f seconds (Total: %d jobs updated)", 
                        i+1, min(i+batch_size, len(jobs)), time.time() - batch_start, updated)
 
-        logger.info("Done — updated %d jobs total (Total time: %.2f seconds)", updated, time.time() - start_time)
+        logger.info("Done – updated %d jobs total (Total time: %.2f seconds)", updated, time.time() - start_time)
 
     finally:
         conn.close()
